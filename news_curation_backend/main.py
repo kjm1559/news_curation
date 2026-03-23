@@ -1,5 +1,6 @@
 import os
 from fastapi import FastAPI, Depends, HTTPException, status, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, REAL, ForeignKey
 from datetime import datetime, timedelta
@@ -128,17 +129,17 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
 # --- Pydantic Models ---
 # Models for request bodies and responses
 
-class UserCreate(BaseModel):
+class UserRegister(BaseModel):
     username: str = Field(..., min_length=3, max_length=50)
     password: str = Field(..., min_length=8) # Basic password strength
 
-class User(BaseModel):
+class UserResponse(BaseModel):
     user_id: int
     username: str
     created_at: datetime
 
     class Config:
-        orm_mode = True # For SQLAlchemy 1.x, use from_attributes = True for SQLAlchemy 2.x
+        from_attributes = True
 
 class Token(BaseModel):
     access_token: str
@@ -154,32 +155,32 @@ class NewsItemBase(BaseModel):
     category: str
 
 class NewsItemCreate(NewsItemBase):
-    pass # If we were creating news items directly via API, not just from scraping
+    pass
 
-class NewsItem(NewsItemBase):
+class NewsItemOut(NewsItemBase):
     news_id: int
     scraped_at: datetime
 
     class Config:
-        orm_mode = True
+        from_attributes = True
 
 # UserNewsInteraction Pydantic Models
 class UserNewsInteractionBase(BaseModel):
-    # viewed_at is set by backend, interest_score is calculated
-    category: str # Category at the time of viewing
+    category: str
 
 class UserNewsInteractionCreate(UserNewsInteractionBase):
-    news_id: int # Required to link to the news item
+    news_id: int
 
-class UserNewsInteraction(UserNewsInteractionBase):
+class UserNewsInteractionOut(BaseModel):
     interaction_id: int
     user_id: int
     news_id: int
+    category: str
     viewed_at: datetime
     interest_score: float
 
     class Config:
-        orm_mode = True
+        from_attributes = True
 
 # UserPreference Pydantic Models
 class UserPreferenceBase(BaseModel):
@@ -187,17 +188,26 @@ class UserPreferenceBase(BaseModel):
     preference_level: float
 
 class UserPreferenceCreate(UserPreferenceBase):
-    pass # User ID is implied by current user
+    pass
 
-class UserPreference(UserPreferenceBase):
+class UserPreferenceOut(UserPreferenceBase):
     preference_id: int
     user_id: int
 
     class Config:
-        orm_mode = True
+        from_attributes = True
 
 # --- FastAPI Application ---
 app = FastAPI(title="News Curation API")
+
+# --- CORS Configuration ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # For production, replace with specific origins
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # --- Background Tasks ---
 def process_scraped_news(db: Session, scraped_data: List[Dict]):
@@ -240,17 +250,21 @@ def run_scraping_task(background_tasks: BackgroundTasks, db: Session = Depends(g
         return {"message": "No new news found during scraping."}
 
 # --- Authentication Endpoints ---
-@app.post("/auth/register", response_model=User, status_code=status.HTTP_201_CREATED)
-def register_user(user: UserCreate, db: Session = Depends(get_db)):
+@app.post("/auth/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
+def register_user(user: UserRegister, db: Session = Depends(get_db)):
     if db.query(User).filter(User.username == user.username).first():
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Username already registered")
     hashed_password = get_password_hash(user.password)
     db_user = User(username=user.username, password_hash=hashed_password)
     db.add(db_user)
-    db.commit()
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Database error: {str(e)}")
     db.refresh(db_user)
     # Return basic user info, not password hash
-    return User(user_id=db_user.user_id, username=db_user.username, created_at=db_user.created_at)
+    return UserResponse(user_id=db_user.user_id, username=db_user.username, created_at=db_user.created_at)
 
 @app.post("/auth/login", response_model=Token)
 def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
@@ -265,10 +279,10 @@ def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db:
     access_token = create_access_token(data={"sub": user.username}, expires_delta=access_token_expires)
     return {"access_token": access_token, "token_type": "bearer"}
 
-@app.get("/users/me", response_model=User)
+@app.get("/users/me", response_model=UserResponse)
 def read_users_me(current_user: User = Depends(get_current_user)):
     # Return user info, exclude password hash
-    return User(user_id=current_user.user_id, username=current_user.username, created_at=current_user.created_at)
+    return UserResponse(user_id=current_user.user_id, username=current_user.username, created_at=current_user.created_at)
 
 # --- News Endpoints ---
 @app.get("/news/categories", response_model=List[str])
@@ -280,7 +294,7 @@ def get_news_categories(db: Session = Depends(get_db)):
         return ["General", "Technology", "Sports", "Business", "Entertainment"] # Default categories
     return [cat[0] for cat in categories]
 
-@app.get("/news/feed", response_model=List[NewsItem])
+@app.get("/news/feed", response_model=List[NewsItemOut])
 def get_news_feed(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -297,17 +311,18 @@ def get_news_feed(
     # 4. Return a ranked list of NewsItem objects.
 
     # For now, return most recent news items as a placeholder
-    recent_news = db.query(NewsItem).order_by(NewsItem.published_at.desc().nulls_last()).offset(skip).limit(limit).all()
+    from sqlalchemy import desc
+    recent_news = db.query(NewsItem).order_by(desc(NewsItem.published_at)).offset(skip).limit(limit).all()
     return recent_news
 
-@app.get("/news/{news_id}", response_model=NewsItem)
+@app.get("/news/{news_id}", response_model=NewsItemOut)
 def get_news_item(news_id: int, db: Session = Depends(get_db)):
     db_news = db.query(NewsItem).filter(NewsItem.news_id == news_id).first()
     if db_news is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="News item not found")
     return db_news
 
-@app.post("/news/{news_id}/view", response_model=UserNewsInteraction)
+@app.post("/news/{news_id}/view", response_model=UserNewsInteractionOut)
 def record_news_view(
     news_id: int,
     interaction_data: UserNewsInteractionCreate,
@@ -339,12 +354,12 @@ def record_news_view(
     return db_interaction
 
 # --- User Preference Endpoints ---
-@app.get("/preferences", response_model=List[UserPreference])
+@app.get("/preferences", response_model=List[UserPreferenceOut])
 def get_user_preferences(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     preferences = db.query(UserPreference).filter(UserPreference.user_id == current_user.user_id).all()
     return preferences
 
-@app.post("/preferences", response_model=UserPreference)
+@app.post("/preferences", response_model=UserPreferenceOut)
 def update_user_preference(
     preference: UserPreferenceCreate,
     current_user: User = Depends(get_current_user),
